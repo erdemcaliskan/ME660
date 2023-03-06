@@ -66,7 +66,7 @@
 #include <deal.II/grid/grid_generator.h>
 #include <deal.II/grid/grid_refinement.h>
 #include <deal.II/grid/grid_out.h>
-
+#include <deal.II/grid/grid_tools.h>
 // DoF includes
 #include <deal.II/dofs/dof_handler.h>
 #include <deal.II/dofs/dof_tools.h>
@@ -236,6 +236,24 @@ namespace Project
     solution.reinit(dof_handler.n_dofs());
     system_rhs.reinit(dof_handler.n_dofs());
 
+    std::vector<bool> boundary_dofs (dof_handler.n_dofs(), false);
+    DoFTools::extract_boundary_dofs (dof_handler,
+                                    ComponentMask(),
+                                    boundary_dofs);
+
+    const unsigned int first_boundary_dof
+      = std::distance (boundary_dofs.begin(),
+                      std::find (boundary_dofs.begin(),
+                                 boundary_dofs.end(),
+                                 true));
+    constraints.clear ();
+    constraints.add_line (first_boundary_dof);
+    constraints.add_line (first_boundary_dof + 1);
+    for (unsigned int i=first_boundary_dof+1; i<dof_handler.n_dofs(); ++i)
+      if (boundary_dofs[i] == true)
+        constraints.add_entry (first_boundary_dof,
+                                          i, 0);
+    constraints.close ();
     // Making use of sparsity pattern
     DynamicSparsityPattern dsp(dof_handler.n_dofs(), dof_handler.n_dofs());
     DoFTools::make_sparsity_pattern(dof_handler,
@@ -447,13 +465,26 @@ namespace Project
   {
     // Create the triangulation
     GridGenerator::hyper_cube(triangulation, -1, 1);
-    
+
+    // Shift the top right corner node
+    //
+    // for (const auto &cell : triangulation.active_cell_iterators())
+    // {
+    //   for (unsigned int i=0; i<GeometryInfo<2>::vertices_per_cell; ++i)
+    //     {
+    //       Point<2> &v = cell->vertex(i);
+    //       if ((std::abs(v(0)-1)<1e-5) && (std::abs(v(1)-1)<1e-5))
+    //         v(0) += 1;
+    //         v(1) += 1;
+    //     }
+    // }
+
     // Set the boundary ids
     triangulation.begin_active()->face(1)->set_boundary_id(1);
     triangulation.begin_active()->face(0)->set_boundary_id(3);
     
     // Refine the mesh
-    // triangulation.refine_global(5);
+    // triangulation.refine_global(4);
 
     std::cout << "   Number of active cells:       "
               << triangulation.n_active_cells() << std::endl;
