@@ -55,10 +55,12 @@
 #include <deal.II/lac/full_matrix.h>
 #include <deal.II/lac/sparse_matrix.h>
 #include <deal.II/lac/dynamic_sparsity_pattern.h>
+#include <deal.II/lac/sparse_direct.h>
 
 // Solver includes
 #include <deal.II/lac/solver_cg.h>
 #include <deal.II/lac/precondition.h>
+#include <deal.II/lac/precondition_selector.h>
 #include <deal.II/lac/affine_constraints.h>
  
 // Grid includes
@@ -111,13 +113,13 @@ namespace Project
                                ((i == j) && (k == l) ? lambda : 0.0));
     return tmp;
   }
- 
+
   // Get the strain tensor from the displacement gradient of the solution
   // e_ij = 0.5 * (du_i/dx_j + du_j/dx_i)
   template <int dim>
-  inline SymmetricTensor<2, dim> get_strain(const FEValues<dim> &fe_values,
-                                            const unsigned int   shape_func,
-                                            const unsigned int   q_point)
+  inline SymmetricTensor<2, dim> get_sym_grad(const FEValues<dim> &fe_values,
+                                              const unsigned int   shape_func,
+                                              const unsigned int   q_point)
   {
     SymmetricTensor<2, dim> tmp;
  
@@ -134,6 +136,40 @@ namespace Project
     return tmp;
   }
 
+  // get tr(e)
+  template <int dim>
+  inline double get_e_trace(const SymmetricTensor<2, dim> &strain)
+  {
+    double trace = 0.0;
+    for (unsigned int i = 0; i < dim; ++i)
+      trace += strain[i][i];
+    return trace;
+  }
+
+  // c_ijkl(e) = a(delta_ik*delta_jl + delta_il*delta_jk) + 
+  //             6*b*e_mm*delta_ij*delta_kl + 
+  //             3/2*c*(delta_ik*e_jl + delta_jl*e_ik + delta_jk*e_il + delta_il*e_jk)
+   template <int dim>
+  SymmetricTensor<4, dim> get_stiffness(const FEValues<dim> &fe_values,
+                                        const unsigned int   shape_func,
+                                        const unsigned int   q_point,
+                                        const double a,
+                                        const double b,
+                                        const double c)
+  {
+    const SymmetricTensor<2, dim> strain = get_sym_grad(fe_values,shape_func,q_point);
+    const double tr_e = get_e_trace(strain);
+    SymmetricTensor<4, dim> tmp;
+    for (unsigned int i = 0; i < dim; ++i)
+      for (unsigned int j = 0; j < dim; ++j)
+        for (unsigned int k = 0; k < dim; ++k)
+          for (unsigned int l = 0; l < dim; ++l)
+            tmp[i][j][k][l] = (((i == k) && (j == l) ? a + 3/2*c*(strain[j][l] + strain[i][k]) : 0.0) +
+                               ((i == l) && (j == k) ? a + 3/2*c*(strain[j][k] + strain[i][l]) : 0.0) +
+                               ((i == j) && (k == l) ? 6*b*tr_e : 0.0));
+    return tmp;
+  }
+ 
   // Get the strain tensor from the displacement gradient
   // e_ij = 0.5 * (du_i/dx_j + du_j/dx_i)
   template <int dim>
@@ -152,7 +188,17 @@ namespace Project
  
     return strain;
   }
-  
+
+  template <int dim>
+  void right_hand_side(const double applied_stress,
+                       std::vector<Tensor<1, dim>> &  values)
+  {
+    for (unsigned int point_n = 0; point_n < 4; ++point_n)
+      {
+        values[point_n][0] = applied_stress;
+      }
+  }
+
   template <int dim>
   class ElasticProblem
   {
@@ -166,22 +212,24 @@ namespace Project
   private:
 
     // Handiling DOFs 
-    void setup_system();
+    void setup_system(const bool initial_step);
 
     // Assemble the system matrix and right hand side
-    void assemble_system();
-
+    void assemble_system(double applied_stress);
+    void solve_nonlinear_timestep(Vector<double> &solution_delta, double applied_stress);
     // Solve the system
-    void solve();
+    void solve(Vector<double> &newton_update);
+
+    Vector<double> ElasticProblem<dim>::get_total_solution(const Vector<double> &solution_delta) const;
 
     // Compute the stress tensor at each quadrature point
-    void extract_stress();
+    void extract_stress(const unsigned int cycle);
 
     // Output the DOFs
     void gnuplot_out(const std::string filename) const;
 
     // Output the solution
-    void output_results() const;
+    void output_results(const unsigned int cycle) const;
 
     // Mesh object
     Triangulation<dim> triangulation;
@@ -199,17 +247,49 @@ namespace Project
     // Sparsity pattern and system matrix
     SparsityPattern      sparsity_pattern;
     SparseMatrix<double> system_matrix;
+    SparseMatrix<double> tangent_matrix;
 
     // Solution and right hand side
-    Vector<double> solution;
+    Vector<double> solution_n;
     Vector<double> system_rhs;
+    Vector<double> newton_update;
+    Vector<double> current_solution;
 
     // Stiffness matrix
-    static const SymmetricTensor<4, dim> stiffness;
+    SymmetricTensor<4, dim> stiffness;
 
     // Material constants
     static constexpr double lambda = 40;
-    static constexpr double mu = 40;
+    static constexpr double mu     = 40;
+    static constexpr double a = 40;
+    static constexpr double b = -50;
+    static constexpr double c = -30;
+
+        struct Errors
+    {
+      Errors() : norm(1.0)
+      {}
+ 
+      void reset()
+      {
+        norm = 1.0;
+      }
+      void normalize(const Errors &rhs)
+      {
+        norm /= rhs.norm;
+      }
+ 
+      double norm;
+    };
+ 
+    Errors error_residual, error_residual_0, error_residual_norm, error_update,
+      error_update_0, error_update_norm;
+ 
+    void get_error_residual(Errors &error_residual);
+ 
+    void get_error_update(const Vector<double> &newton_update,
+                          Errors &              error_update);
+
   };
  
   // Constructor
@@ -219,23 +299,61 @@ namespace Project
     , fe(FE_Q<dim>(1), dim)
     , quadrature_formula(fe.degree + 1)
   {}
-  
-  // Stiffness matrix
+
+  template <int dim>
+  void ElasticProblem<dim>::get_error_residual(Errors &error_residual)
+  {
+    Vector<double> error_res(dof_handler.n_dofs());
+ 
+    for (unsigned int i = 0; i < dof_handler.n_dofs(); ++i)
+      if (!constraints.is_constrained(i))
+        error_res(i) = system_rhs(i);
+ 
+    error_residual.norm = error_res.l2_norm();
+  }
+
+  template <int dim>
+  void ElasticProblem<dim>::get_error_update(const Vector<double> &newton_update,
+                                             Errors &              error_update)
+  {
+    Vector<double> error_ud(dof_handler.n_dofs());
+    for (unsigned int i = 0; i < dof_handler.n_dofs(); ++i)
+      if (!constraints.is_constrained(i))
+        error_ud(i) = newton_update(i);
+ 
+    error_update.norm = error_ud.l2_norm();
+  }
+
+  template <int dim>
+  Vector<double> ElasticProblem<dim>::get_total_solution(
+    const Vector<double> &solution_delta) const
+  {
+    Vector<double> solution_total(solution_n);
+    solution_total += solution_delta;
+    return solution_total;
+  }
+/*   // Stiffness matrix
   template <int dim>
   const SymmetricTensor<4, dim> ElasticProblem<dim>::stiffness =
     get_stiffness<dim>(lambda,
-                       mu    );
+                       mu    ); */
  
   template <int dim>
-  void ElasticProblem<dim>::setup_system()
+  void ElasticProblem<dim>::setup_system(const bool initial_step)
   {
-    // Allocate the memory for the DOFs and enumarate them
-    dof_handler.distribute_dofs(fe);
+      if (initial_step)
+    {
+      // Allocate the memory for the DOFs and enumarate them
+      dof_handler.distribute_dofs(fe);
 
-    // Resize the solution and right hand side vectors
-    solution.reinit(dof_handler.n_dofs());
+      // Resize the solution and right hand side vectors
+      solution_n.reinit(dof_handler.n_dofs());
+    }
+    
+    newton_update.reinit(dof_handler.n_dofs());
     system_rhs.reinit(dof_handler.n_dofs());
 
+    // u_y = 0 at bottom left node
     std::vector<bool> boundary_dofs (dof_handler.n_dofs(), false);
     DoFTools::extract_boundary_dofs (dof_handler,
                                     ComponentMask(),
@@ -254,6 +372,7 @@ namespace Project
         constraints.add_entry (first_boundary_dof,
                                           i, 0);
     constraints.close ();
+
     // Making use of sparsity pattern
     DynamicSparsityPattern dsp(dof_handler.n_dofs(), dof_handler.n_dofs());
     DoFTools::make_sparsity_pattern(dof_handler,
@@ -261,29 +380,46 @@ namespace Project
                                     constraints,
                                     /*keep_constrained_dofs = */ false);
     sparsity_pattern.copy_from(dsp);
- 
+
+    tangent_matrix.clear();
+    tangent_matrix.reinit(sparsity_pattern);
     // Resize the system matrix
     system_matrix.reinit(sparsity_pattern);
   }
 
   template <int dim>
-  void ElasticProblem<dim>::assemble_system()
+  void ElasticProblem<dim>::assemble_system(double applied_stress)
   {
+    // QGauss<dim - 1> face_quadrature_formula(fe.degree + 1);
+    // const unsigned int n_face_q_points = face_quadrature_formula.size();
+
+    tangent_matrix = 0.0;
+
     // FE object
     FEValues<dim> fe_values(fe,
                             quadrature_formula,
                             update_values | update_gradients |
                               update_quadrature_points | update_JxW_values);
- 
+
+    // FEFaceValues<dim> fe_face_values(fe,
+    //                                 face_quadrature_formula,
+    //                                 update_values | update_quadrature_points |
+    //                                   update_normal_vectors |
+    //                                   update_JxW_values);
+
     const unsigned int dofs_per_cell = fe.n_dofs_per_cell();
     const unsigned int n_q_points    = quadrature_formula.size();
  
     FullMatrix<double> cell_matrix(dofs_per_cell, dofs_per_cell);
     Vector<double>     cell_rhs(dofs_per_cell);
- 
+
+    std::vector<Tensor<1, dim>> old_solution_gradients(n_q_points);
     std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
   
     std::vector<Tensor<1, dim>> rhs_values(n_q_points);
+    
+    // Tensor<1, dim> pressure;
+    // pressure[0] = 10;
 
     // Loop over all cells
     for (const auto &cell : dof_handler.active_cell_iterators())
@@ -293,40 +429,41 @@ namespace Project
  
         fe_values.reinit(cell);
 
+        right_hand_side(applied_stress, rhs_values);
+
         for (unsigned int i = 0; i < dofs_per_cell; ++i)
           for (unsigned int j = 0; j < dofs_per_cell; ++j)
             for (unsigned int q_point = 0; q_point < n_q_points; ++q_point)
               {
                 const SymmetricTensor<2, dim>
-                  eps_phi_i = get_strain(fe_values, i, q_point),
-                  eps_phi_j = get_strain(fe_values, j, q_point);
-
+                  eps_phi_i = get_sym_grad(fe_values, i, q_point),
+                  eps_phi_j = get_sym_grad(fe_values, j, q_point);
+                  stiffness = get_stiffness(fe_values, j, q_point, a , b ,c);
                 // K_ij = int(eps_i * C * eps_j) dx
                 cell_matrix(i, j) += (eps_phi_i *            
                                       stiffness * 
                                       eps_phi_j              
                                       ) *                    
-                                     fe_values.JxW(q_point); 
+                                     fe_values.JxW(q_point);
               }
 
-        // Loop over all quadrature points for RHS == 0 since
-        // there is Neumann boundary condition & force applied
         for (const unsigned int i : fe_values.dof_indices())
           {
             const unsigned int component_i =
               fe.system_to_component_index(i).first;
-
+ 
             for (const unsigned int q_point :
                  fe_values.quadrature_point_indices())
-              cell_rhs(i) += fe_values.shape_value(i, q_point) *
+              cell_rhs(i) = fe_values.shape_value(i, q_point) *
                              rhs_values[q_point][component_i] *
-                             fe_values.JxW(q_point) * 0.0 ;
+                             fe_values.JxW(q_point);
           }
-
-        // Assembly
+        
         cell->get_dof_indices(local_dof_indices);
         constraints.distribute_local_to_global(
-          cell_matrix, cell_rhs, local_dof_indices, system_matrix, system_rhs);
+          cell_matrix, cell_rhs, local_dof_indices, tangent_matrix, system_rhs);
+
+          std::cout << "system_rhs = " << system_rhs << std::endl;
       }
 
     // Set the boundary conditions
@@ -336,7 +473,7 @@ namespace Project
     std::map<types::global_dof_index, double> boundary_values;
 
     // Right boundary, u = 0.01*L
-    {
+/*     {
       const int boundary_id = 1;
 
       VectorTools::interpolate_boundary_values(
@@ -345,7 +482,7 @@ namespace Project
         Functions::ConstantFunction<dim> (std::vector<double>({0.02, 0.})),
         boundary_values,
         fe.component_mask(x_displacement));
-    }
+    } */
 
     // Left boundary, u = 0
     {
@@ -361,7 +498,7 @@ namespace Project
 
     // Apply the boundary conditions
     MatrixTools::apply_boundary_values(
-    boundary_values, system_matrix, solution, system_rhs, true);
+    boundary_values, tangent_matrix, newton_update, system_rhs, true);
   }
  
   // Output DOF numbering in gnuplot format (step-2)
@@ -384,18 +521,113 @@ namespace Project
     out << "e" << std::endl;
   }
  
+  template <int dim>
+  void ElasticProblem<dim>::solve_nonlinear_timestep(Vector<double> &solution_delta, double applied_stress)
+  {
+    Vector<double> solution_total(solution_n);
+    Vector<double> newton_update(dof_handler.n_dofs());
+ 
+    error_residual.reset();
+    error_residual_0.reset();
+    error_residual_norm.reset();
+    error_update.reset();
+    error_update_0.reset();
+    error_update_norm.reset();
+ 
+    unsigned int newton_iteration = 0;
+    for (; newton_iteration < 100; ++newton_iteration)
+      {
+        std::cout << ' ' << std::setw(2) << newton_iteration << ' '
+                  << std::flush;
+ 
+        // make_constraints(newton_iteration);
+        assemble_system(applied_stress);
+ 
+        get_error_residual(error_residual);
+        if (newton_iteration == 0)
+          error_residual_0 = error_residual;
+ 
+        error_residual_norm = error_residual;
+        error_residual_norm.normalize(error_residual_0);
+ 
+        if (newton_iteration > 0 && error_update_norm.norm <= 1e-16 &&
+            error_residual_norm.norm <= 1e-16)
+          {
+            std::cout << " CONVERGED! " << std::endl;
+             
+            break;
+          }
+ 
+        //const std::pair<unsigned int, double> lin_solver_output =
+        solve(newton_update);
+ 
+        get_error_update(newton_update, error_update);
+        if (newton_iteration == 0)
+          error_update_0 = error_update;
+ 
+        error_update_norm = error_update;
+        error_update_norm.normalize(error_update_0);
+
+        solution_delta += newton_update;
+        
+        Vector<double> solution_total(get_total_solution(solution_delta));
+
+        for (const auto &cell : dof_handler.active_cell_iterators())
+        {
+          cell->get_dof_indices(local_dof_indices);
+          for (unsigned int i = 0; i < fe.; ++i)
+          {
+            const unsigned int component_i =
+                fe.system_to_component_index(i).first;
+            solution_total(local_dof_indices[i]) += newton_update(local_dof_indices[i]);
+          }
+        }
+        //update_qph_incremental(solution_delta);
+ 
+        std::cout << " | " << std::fixed << std::setprecision(3) << std::setw(7)
+                  << std::scientific << error_residual_norm.norm << "  " << error_update_norm.norm << std::endl;
+      }
+
+    // solution_total += solution_delta;
+
+    AssertThrow(newton_iteration < 100,
+                ExcMessage("No convergence in nonlinear solver!"));
+  } 
+
   // CG solver without preconditioner
   template <int dim>
-  void ElasticProblem<dim>::solve()
+  void ElasticProblem<dim>::solve(Vector<double> &newton_update)
   {
-    SolverControl            solver_control(1000, 1e-12);
+    Vector<double> A(dof_handler.n_dofs());
+
+    unsigned int lin_it  = 0;
+    double       lin_res = 0.0;
+
+    SolverControl            solver_control(100, system_rhs.l2_norm() * 1e-6);
+    std::cout << "system_rhs.l2_norm() = " << system_rhs.l2_norm() << std::endl;
+
     SolverCG<Vector<double>> solver(solver_control);
-    solver.solve(system_matrix, solution, system_rhs, PreconditionIdentity());
+
+    PreconditionSSOR<SparseMatrix<double>> preconditioner;
+    preconditioner.initialize(tangent_matrix, 1.2);
+
+    //solver.solve(tangent_matrix, newton_update, system_rhs, PreconditionIdentity());
+    SparseDirectUMFPACK A_direct;
+            A_direct.initialize(tangent_matrix);
+            A_direct.vmult(newton_update, system_rhs);
+/*     lin_it  = 1; //solver_control.last_step();
+    lin_res = 1; //solver_control.last_value();
+
+    std::cout << "lin_it = " << lin_it << "\t";
+    std::cout << "lin_res = " << lin_res << std::endl; */
+
+    // solution.add(1, newton_update);
+    constraints.distribute(newton_update);
   }
 
   // Output results in vtu format
   template <int dim>
-  void ElasticProblem<dim>::output_results() const
+  void ElasticProblem<dim>::output_results(const unsigned int cycle) const
   {
     gnuplot_out("gnuplot.gpl");
 
@@ -421,16 +653,16 @@ namespace Project
           Assert(false, ExcNotImplemented());
       }
  
-    data_out.add_data_vector(solution, solution_names);
+    data_out.add_data_vector(solution_n, solution_names);
     data_out.build_patches();
  
-    std::ofstream output("solution.vtk");
+    std::ofstream output("solution-" + std::to_string(cycle) + ".vtk");
     data_out.write_vtk(output);
   } 
   
   // Extract stress from the solution for each quadrature point
   template<int dim>
-  void ElasticProblem<dim>::extract_stress()
+  void ElasticProblem<dim>::extract_stress(const unsigned int cycle)
   {
     FEValues<dim> fe_values(fe,
                             quadrature_formula,
@@ -439,7 +671,7 @@ namespace Project
 
     const unsigned int n_q_points = quadrature_formula.size();
 
-    std::fstream out("stress.txt", std::ios::out);
+    std::fstream out("stress-" + std::to_string(cycle) + ".txt", std::ios::out);
 
     std::vector<std::vector<Tensor<1, dim>>> displacement_grads(
       quadrature_formula.size(), std::vector<Tensor<1, dim>>(dim));
@@ -447,7 +679,7 @@ namespace Project
     for (auto &cell : dof_handler.active_cell_iterators())
     {
       fe_values.reinit(cell);
-      fe_values.get_function_gradients(solution, displacement_grads);
+      fe_values.get_function_gradients(solution_n, displacement_grads);
 
       for (unsigned int q_point = 0; q_point < n_q_points; ++q_point)
         {
@@ -463,6 +695,8 @@ namespace Project
   template <int dim>
   void ElasticProblem<dim>::run()
   {
+    const int max_cycle = 100;
+    double applied_stress = 6.0/max_cycle;
     // Create the triangulation
     GridGenerator::hyper_cube(triangulation, -1, 1);
 
@@ -478,27 +712,32 @@ namespace Project
     //         v(1) += 1;
     //     }
     // }
-
+    
     // Set the boundary ids
     triangulation.begin_active()->face(1)->set_boundary_id(1);
     triangulation.begin_active()->face(0)->set_boundary_id(3);
-    
     // Refine the mesh
     // triangulation.refine_global(4);
-
     std::cout << "   Number of active cells:       "
               << triangulation.n_active_cells() << std::endl;
-    
-    setup_system();
- 
-    std::cout << "   Number of degrees of freedom: " << dof_handler.n_dofs()
-              << std::endl;
- 
-    assemble_system();
-    solve();
-    extract_stress();
-    output_results();
+    setup_system(true);    
 
+    std::cout << "   Number of degrees of freedom: " << dof_handler.n_dofs()
+                << std::endl;
+
+    Vector<double> solution_delta(dof_handler.n_dofs());
+
+     for (unsigned int cycle = 0; cycle < max_cycle; ++cycle)
+    {
+      std::cout << "Cycle " << cycle << ':' << std::endl;
+      
+      assemble_system(applied_stress);
+      solve_nonlinear_timestep(solution_delta, applied_stress);
+      setup_system(true);
+      extract_stress(cycle);
+      output_results(cycle);
+      applied_stress += 6.0/max_cycle; 
+    }
   }
 } // namespace Project
  
