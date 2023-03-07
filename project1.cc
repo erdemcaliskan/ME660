@@ -7,39 +7,14 @@
  * https://www.dealii.org/current/doxygen/deal.II/step_18.html
  * https://www.dealii.org/current/doxygen/deal.II/step_44.html
  * 
- * The problem is to find the displacement field u(x) that
- * satisfies the boundary conditions and the following equation:
- * 
- *   div(sigma(u)) = 0
- * 
- * where sigma(u) is the stress tensor, given by
- * 
- *   sigma(u) = lambda * (div(u) I) + mu * (grad(u) + grad(u)^T)
- * 
- * and lambda and mu are material constants. The boundary conditions are:
- * 
- *   u = 0 on the boundary on left,
- *   u = 0.01*L on the boundary on right
- * 
- * The domain is a rectangle with dimensions 2 x 2. The material constants
- * are lambda = 40 and mu = 40.
- * 
- * The program uses linear finite elements and CG solver. 
- * 
  * ---------------------------------------------------------------------
  * 
- * Capabilities:
- * 
- * Multiple elements
- * Displacement field is written in vtu format to visualize in paraview.
- * Stress at the quadrature points is extracted and written in a file.
- * DOFs are written in gnuplot format.
+ * Tested with linear Cijlk and it is working. But I couldn't figure out
+ * why the residual is not changing after the Newton step.
  * 
  * Future work:
  * 
- * The program can be extended to write the stress to vtu format.
- * Input file can be added to read the material constants and other properties.
- * 
+ * Input file will be added to read the material constants and other properties.
  * 
  * ---------------------------------------------------------------------
  *
@@ -96,7 +71,7 @@ namespace Project
  
   // Auxiliary function to compute the stress tensor from the displacement (step-18)
 
-  // Get the 4x4x4x4 stiffness matrix for the given material constants 
+  // Get the 4x4x4x4 stiffness matrix for the given material constants (NOT IN USE)
   // C_ijkl = lambda * delta_ij * delta_kl + mu * (delta_ik * delta_jl + delta_il * delta_jk)
   template <int dim>
   SymmetricTensor<4, dim> get_stiffness(const double lambda,
@@ -116,9 +91,9 @@ namespace Project
   // Get the strain tensor from the displacement gradient of the solution
   // e_ij = 0.5 * (du_i/dx_j + du_j/dx_i)
   template <int dim>
-  inline SymmetricTensor<2, dim> get_strain(const FEValues<dim> &fe_values,
-                                            const unsigned int   shape_func,
-                                            const unsigned int   q_point)
+  inline SymmetricTensor<2, dim> get_sym_grad(const FEValues<dim> &fe_values,
+                                              const unsigned int   shape_func,
+                                              const unsigned int   q_point)
   {
     SymmetricTensor<2, dim> tmp;
  
@@ -139,7 +114,7 @@ namespace Project
   // e_ij = 0.5 * (du_i/dx_j + du_j/dx_i)
   template <int dim>
   inline SymmetricTensor<2, dim>
-  get_strain(const std::vector<Tensor<1, dim>> &grad)
+  get_sym_grad(const std::vector<Tensor<1, dim>> &grad)
   {
     Assert(grad.size() == dim, ExcInternalError());
  
@@ -165,42 +140,47 @@ namespace Project
     void run();
  
   private:
+      void setup_system();
 
-    // Handiling DOFs 
-    void setup_system();
+      void assemble_system(bool update_stiffness);
+      void right_hand_side(std::vector<Tensor<1, dim>> &values);
+      void solve_nonlinear_timestep();
+      void solve();
+      void extract_stress();
+      void gnuplot_out(const std::string filename) const;
+      void output_results() const;
 
-    void assemble_system(bool update_stiffness);
-    void right_hand_side(std::vector<Tensor<1, dim>> & values);
-    void solve_nonlinear_timestep();
-    void solve();
-    void extract_stress();
-    void gnuplot_out(const std::string filename) const;
-    void output_results() const;
+      Triangulation<dim> triangulation;
+      DoFHandler<dim> dof_handler;
 
-    Triangulation<dim> triangulation;
-    DoFHandler<dim>    dof_handler;
+      FESystem<dim> fe;
+      const QGauss<dim> quadrature_formula;
 
-    FESystem<dim> fe;
-    const QGauss<dim> quadrature_formula;
+      AffineConstraints<double> constraints;
 
-    AffineConstraints<double> constraints;
+      SparsityPattern sparsity_pattern;
+      SparseMatrix<double> tangent_matrix;
 
-    SparsityPattern      sparsity_pattern;
-    SparseMatrix<double> tangent_matrix;
+      Vector<double> solution_n;
+      Vector<double> newton_update;
+      Vector<double> system_rhs;
+      SymmetricTensor<4, dim> get_stiffness(const SymmetricTensor<2, dim> &strain_tensor);
 
-    Vector<double> solution_n;
-    Vector<double> newton_update;
-    Vector<double> system_rhs;
+      double get_e_trace(const SymmetricTensor<2, dim> &strain_tensor);
+      
+      // Stiffness matrix
+      SymmetricTensor<4, dim> stiffness;
 
-    // Stiffness matrix
-    static const SymmetricTensor<4, dim> stiffness;
+      // Material constants
+      static constexpr double lambda = 40;
+      static constexpr double mu = 40;
 
-    // Material constants
-    static constexpr double lambda = 40;
-    static constexpr double mu = 40;
+      static constexpr double a =  40;
+      static constexpr double b = -50;
+      static constexpr double c = -30;
 
-    int cycle;
-    double force;
+      int cycle;
+      double force;
   };
  
   // Constructor
@@ -220,11 +200,35 @@ namespace Project
       }
   }
 
-  // Stiffness matrix
+
+  // c_ijkl(e) = a(delta_ik*delta_jl + delta_il*delta_jk) + 
+  //             6*b*e_mm*delta_ij*delta_kl + 
+  //             3/2*c*(delta_ik*e_jl + delta_jl*e_ik + delta_jk*e_il + delta_il*e_jk)
   template <int dim>
-  const SymmetricTensor<4, dim> ElasticProblem<dim>::stiffness =
-    get_stiffness<dim>(lambda,
-                       mu    );
+  SymmetricTensor<4, dim> ElasticProblem<dim>::
+                          get_stiffness(const SymmetricTensor<2, dim> &strain_tensor)
+  {
+    const double tr_e = get_e_trace(strain_tensor);
+    SymmetricTensor<4, dim> tmp;
+    for (unsigned int i = 0; i < dim; ++i)
+      for (unsigned int j = 0; j < dim; ++j)
+        for (unsigned int k = 0; k < dim; ++k)
+          for (unsigned int l = 0; l < dim; ++l)
+            tmp[i][j][k][l] = (((i == k) && (j == l) ? a + 3/2*c*(strain_tensor[j][l] + strain_tensor[i][k]) : 0.0) +
+                               ((i == l) && (j == k) ? a + 3/2*c*(strain_tensor[j][k] + strain_tensor[i][l]) : 0.0) +
+                               ((i == j) && (k == l) ? 6*b*tr_e : 0.0));
+    return tmp;     
+  }
+
+  // get tr(e)
+  template <int dim>
+  inline double ElasticProblem<dim>::get_e_trace(const SymmetricTensor<2, dim> &strain_tensor)
+  {
+    double trace = 0.0;
+    for (unsigned int i = 0; i < dim; ++i)
+      trace += strain_tensor[i][i];
+    return trace;
+  }
  
   template <int dim>
   void ElasticProblem<dim>::setup_system()
@@ -287,6 +291,8 @@ namespace Project
   
     std::vector<Tensor<1, dim>> rhs_values(n_q_points);
 
+    const FEValuesExtractors::Vector displacement(0);
+
     // Loop over all cells
     for (const auto &cell : dof_handler.active_cell_iterators())
       {
@@ -298,13 +304,20 @@ namespace Project
         {     
         right_hand_side(rhs_values);
 
+        std::vector<SymmetricTensor<2, dim>> strain_tensor(n_q_points);
+        fe_values[displacement].get_function_symmetric_gradients(solution_n, strain_tensor);
+        //std::cout << std::endl << "strain_tensor[0] = " << strain_tensor[0] << std::endl;
+        //std::cout << "strain_tensor[1] = " << strain_tensor[1] << std::endl;
+        //std::cout << "strain_tensor[2] = " << strain_tensor[2] << std::endl;
+        //std::cout << "strain_tensor[3] = " << strain_tensor[3] << std::endl;
         for (unsigned int i = 0; i < dofs_per_cell; ++i)
           for (unsigned int j = 0; j < dofs_per_cell; ++j)
             for (unsigned int q_point = 0; q_point < n_q_points; ++q_point)
               {
                 const SymmetricTensor<2, dim>
-                  eps_phi_i = get_strain(fe_values, i, q_point),
-                  eps_phi_j = get_strain(fe_values, j, q_point);
+                  eps_phi_i = get_sym_grad(fe_values, i, q_point),
+                  eps_phi_j = get_sym_grad(fe_values, j, q_point);
+                  stiffness = get_stiffness(strain_tensor[q_point]);
 
                 // K_ij = int(eps_i * C * eps_j) dx
                 cell_matrix(i, j) += (eps_phi_i *            
@@ -330,12 +343,14 @@ namespace Project
 
         // Assembly
         cell->get_dof_indices(local_dof_indices);
+        system_rhs.reinit(dof_handler.n_dofs());
         if (update_stiffness)
           constraints.distribute_local_to_global(
           cell_matrix, cell_rhs, local_dof_indices, tangent_matrix, system_rhs);
         else
         {
-          system_rhs.reinit(dof_handler.n_dofs());
+          //system_rhs.reinit(dof_handler.n_dofs());
+          //cell_rhs *= -1;
           constraints.distribute_local_to_global(
           cell_rhs, local_dof_indices, system_rhs);
         }         
@@ -387,7 +402,7 @@ namespace Project
     while (newton_iteration < 10)
     {
       solve();
-      assemble_system(false);
+      assemble_system(true);
       //constraints.distribute(newton_update);
       //solution.add(1.0, newton_update);
       solution_n += newton_update;
@@ -492,7 +507,7 @@ namespace Project
         {
           const SymmetricTensor<2, dim> stress = 
           ((stiffness *
-                get_strain(displacement_grads[q_point])));
+                get_sym_grad(displacement_grads[q_point])));
 
         out << stress << std::endl;
         }
@@ -534,7 +549,7 @@ namespace Project
               << std::endl;
 
     cycle = 0;
-    force = 160/150;
+    force = 0.02;
     for(unsigned int i=0; i<10; ++i)
     {
       std::cout << "----------------------------------------------------"
@@ -548,7 +563,7 @@ namespace Project
       extract_stress();
       output_results();
       cycle++;
-      force += 160/150;
+      force += 0.02;
     }
   }
 } // namespace Project
