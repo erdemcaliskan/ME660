@@ -147,7 +147,9 @@ namespace Project
       void solve_nonlinear_timestep();
       void solve();
       void extract_stress();
-      void gnuplot_out(const std::string filename) const;
+      void gnuplot_out
+
+      (const std::string filename) const;
       void output_results() const;
 
       Triangulation<dim> triangulation;
@@ -165,8 +167,7 @@ namespace Project
       Vector<double> newton_update;
       Vector<double> system_rhs;
       SymmetricTensor<4, dim> get_stiffness(const SymmetricTensor<2, dim> &strain_tensor);
-
-      double get_e_trace(const SymmetricTensor<2, dim> &strain_tensor);
+      SymmetricTensor<2, dim> get_stress(const SymmetricTensor<2, dim> &strain_tensor);
       
       // Stiffness matrix
       SymmetricTensor<4, dim> stiffness;
@@ -208,26 +209,30 @@ namespace Project
   SymmetricTensor<4, dim> ElasticProblem<dim>::
                           get_stiffness(const SymmetricTensor<2, dim> &strain_tensor)
   {
-    const double tr_e = get_e_trace(strain_tensor);
     SymmetricTensor<4, dim> tmp;
     for (unsigned int i = 0; i < dim; ++i)
       for (unsigned int j = 0; j < dim; ++j)
         for (unsigned int k = 0; k < dim; ++k)
           for (unsigned int l = 0; l < dim; ++l)
-            tmp[i][j][k][l] = (((i == k) && (j == l) ? a + 3/2*c*(strain_tensor[j][l] + strain_tensor[i][k]) : 0.0) +
-                               ((i == l) && (j == k) ? a + 3/2*c*(strain_tensor[j][k] + strain_tensor[i][l]) : 0.0) +
-                               ((i == j) && (k == l) ? 6*b*tr_e : 0.0));
+            for (unsigned int m = 0; m < dim; ++m)
+              tmp[i][j][k][l] = (((i == k) && (j == l) ? a + 3/2*c*(strain_tensor[j][l] + strain_tensor[i][k]) : 0.0) +
+                                 ((i == l) && (j == k) ? a + 3/2*c*(strain_tensor[j][k] + strain_tensor[i][l]) : 0.0) +
+                                 ((i == j) && (k == l) ? 6*b*strain_tensor[m][m] : 0.0));
     return tmp;     
   }
 
-  // get tr(e)
   template <int dim>
-  inline double ElasticProblem<dim>::get_e_trace(const SymmetricTensor<2, dim> &strain_tensor)
+  SymmetricTensor<2, dim> ElasticProblem<dim>::get_stress(const SymmetricTensor<2, dim> &strain_tensor)
   {
-    double trace = 0.0;
+    SymmetricTensor<2, dim> tmp;
     for (unsigned int i = 0; i < dim; ++i)
-      trace += strain_tensor[i][i];
-    return trace;
+      for (unsigned int j = 0; j < dim; ++j)
+        for (unsigned int m = 0; m < dim; ++m)
+          for (unsigned int n = 0; n < dim; ++n)
+            tmp[i][j] = ((i == j)  ? 3*b*strain_tensor[m][m]*strain_tensor[n][n] 
+                                   : 2*a*strain_tensor[i][j] + 
+                                     3*c*strain_tensor[i][m]*strain_tensor[j][m]);
+    return tmp;   
   }
  
   template <int dim>
@@ -305,7 +310,7 @@ namespace Project
         right_hand_side(rhs_values);
 
         std::vector<SymmetricTensor<2, dim>> strain_tensor(n_q_points);
-        fe_values[displacement].get_function_symmetric_gradients(solution_n, strain_tensor);
+        fe_values[displacement].get_function_symmetric_gradients(newton_update, strain_tensor);
         //std::cout << std::endl << "strain_tensor[0] = " << strain_tensor[0] << std::endl;
         //std::cout << "strain_tensor[1] = " << strain_tensor[1] << std::endl;
         //std::cout << "strain_tensor[2] = " << strain_tensor[2] << std::endl;
@@ -329,18 +334,36 @@ namespace Project
         }
         // Loop over all quadrature points for RHS == 0 since
         // there is Neumann boundary condition & force applied
+
+    std::vector<std::vector<Tensor<1, dim>>> displacement_grads(
+      quadrature_formula.size(), std::vector<Tensor<1, dim>>(dim));
+
+      
         for (const unsigned int i : fe_values.dof_indices())
           {
+            std::vector<SymmetricTensor<2, dim>> strain_tensor(n_q_points);
+            fe_values[displacement].get_function_symmetric_gradients(newton_update, strain_tensor);
+            
             const unsigned int component_i =
               fe.system_to_component_index(i).first;
 
             for (const unsigned int q_point :
                  fe_values.quadrature_point_indices())
-              cell_rhs(i) += fe_values.shape_value(i, q_point) *
-                             rhs_values[q_point][component_i] *
-                             fe_values.JxW(q_point);
-          }
+                 {
 
+                  stiffness = get_stiffness(strain_tensor[q_point]);
+                  const SymmetricTensor<2, dim> stress = get_stress(strain_tensor[q_point]);
+                  if(update_stiffness)
+                  cell_rhs(i) += (fe_values.shape_value(i, q_point) *
+                             rhs_values[q_point][component_i] - stress * strain_tensor[q_point])* //   
+                             fe_values.JxW(q_point);
+                  else
+                  cell_rhs(i) -= (stress * strain_tensor[q_point])* //   
+                             fe_values.JxW(q_point);
+
+                  }
+          }
+        //std::cout<< std::endl << "cell_rhs = " << cell_rhs << std::endl;
         // Assembly
         cell->get_dof_indices(local_dof_indices);
         system_rhs.reinit(dof_handler.n_dofs());
@@ -349,7 +372,7 @@ namespace Project
           cell_matrix, cell_rhs, local_dof_indices, tangent_matrix, system_rhs);
         else
         {
-          //system_rhs.reinit(dof_handler.n_dofs());
+          system_rhs.reinit(dof_handler.n_dofs());
           //cell_rhs *= -1;
           constraints.distribute_local_to_global(
           cell_rhs, local_dof_indices, system_rhs);
@@ -402,8 +425,9 @@ namespace Project
     while (newton_iteration < 10)
     {
       solve();
-      assemble_system(true);
-      //constraints.distribute(newton_update);
+      // constraints.distribute(newton_update);
+      assemble_system(false);
+      
       //solution.add(1.0, newton_update);
       solution_n += newton_update;
       residual = system_rhs.l2_norm();
@@ -441,7 +465,7 @@ namespace Project
   {
 /*     SolverControl            solver_control(1000, 1e-12);
     SolverCG<Vector<double>> solver(solver_control);
-    solver.solve(tangent_matrix, newton_update, system_rhs, PreconditionIdentity()); */
+    solver.solve(tangent_matrix, newton_update, system_rhs, PreconditionIdentity());  */
     SparseDirectUMFPACK A_direct;
             A_direct.initialize(tangent_matrix);
             A_direct.vmult(newton_update, system_rhs);
@@ -495,21 +519,19 @@ namespace Project
 
     std::fstream out("stress-" + std::to_string(cycle) + ".txt", std::ios::out);
 
-    std::vector<std::vector<Tensor<1, dim>>> displacement_grads(
-      quadrature_formula.size(), std::vector<Tensor<1, dim>>(dim));
+    const FEValuesExtractors::Vector displacement(0);
+    
 
     for (auto &cell : dof_handler.active_cell_iterators())
     {
       fe_values.reinit(cell);
-      fe_values.get_function_gradients(solution_n, displacement_grads);
 
+      std::vector<SymmetricTensor<2, dim>> strain_tensor(n_q_points);
+      fe_values[displacement].get_function_symmetric_gradients(solution_n, strain_tensor);
       for (unsigned int q_point = 0; q_point < n_q_points; ++q_point)
         {
-          const SymmetricTensor<2, dim> stress = 
-          ((stiffness *
-                get_sym_grad(displacement_grads[q_point])));
-
-        out << stress << std::endl;
+          
+          out << get_stress(strain_tensor[q_point]) << std::endl;
         }
     }
   }
@@ -538,7 +560,7 @@ namespace Project
     triangulation.begin_active()->face(0)->set_boundary_id(3);
     
     // Refine the mesh
-    // triangulation.refine_global(4);
+    triangulation.refine_global(4);
 
     std::cout << "   Number of active cells:       "
               << triangulation.n_active_cells() << std::endl;
@@ -549,7 +571,7 @@ namespace Project
               << std::endl;
 
     cycle = 0;
-    force = 0.02;
+    force = 100;
     for(unsigned int i=0; i<10; ++i)
     {
       std::cout << "----------------------------------------------------"
@@ -563,7 +585,7 @@ namespace Project
       extract_stress();
       output_results();
       cycle++;
-      force += 0.02;
+      force += 100;
     }
   }
 } // namespace Project
