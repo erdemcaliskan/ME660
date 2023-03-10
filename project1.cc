@@ -310,7 +310,7 @@ namespace Project
         right_hand_side(rhs_values);
 
         std::vector<SymmetricTensor<2, dim>> strain_tensor(n_q_points);
-        fe_values[displacement].get_function_symmetric_gradients(newton_update, strain_tensor);
+        fe_values[displacement].get_function_symmetric_gradients(solution_n, strain_tensor);
         //std::cout << std::endl << "strain_tensor[0] = " << strain_tensor[0] << std::endl;
         //std::cout << "strain_tensor[1] = " << strain_tensor[1] << std::endl;
         //std::cout << "strain_tensor[2] = " << strain_tensor[2] << std::endl;
@@ -335,8 +335,8 @@ namespace Project
         // Loop over all quadrature points for RHS == 0 since
         // there is Neumann boundary condition & force applied
 
-    std::vector<std::vector<Tensor<1, dim>>> displacement_grads(
-      quadrature_formula.size(), std::vector<Tensor<1, dim>>(dim));
+        std::vector<std::vector<Tensor<1, dim>>> displacement_grads(
+          quadrature_formula.size(), std::vector<Tensor<1, dim>>(dim));
 
       
         for (const unsigned int i : fe_values.dof_indices())
@@ -354,26 +354,27 @@ namespace Project
                   stiffness = get_stiffness(strain_tensor[q_point]);
                   const SymmetricTensor<2, dim> stress = get_stress(strain_tensor[q_point]);
                   if(update_stiffness)
+                  {
                   cell_rhs(i) += (fe_values.shape_value(i, q_point) *
-                             rhs_values[q_point][component_i] - stress * strain_tensor[q_point])* //   
+                             rhs_values[q_point][component_i] )* //   - stress * strain_tensor[q_point]
                              fe_values.JxW(q_point);
-                  else
-                  cell_rhs(i) -= (stress * strain_tensor[q_point])* //   
-                             fe_values.JxW(q_point);
-
+                  // else
+                   cell_rhs(i) -= (stress * strain_tensor[q_point])* //   
+                              fe_values.JxW(q_point);
+                  }
                   }
           }
-        //std::cout<< std::endl << "cell_rhs = " << cell_rhs << std::endl;
+        // std::cout<< std::endl << "cell_rhs = " << cell_rhs << std::endl;
         // Assembly
         cell->get_dof_indices(local_dof_indices);
-        system_rhs.reinit(dof_handler.n_dofs());
+        // system_rhs.reinit(dof_handler.n_dofs());
         if (update_stiffness)
           constraints.distribute_local_to_global(
           cell_matrix, cell_rhs, local_dof_indices, tangent_matrix, system_rhs);
         else
         {
-          system_rhs.reinit(dof_handler.n_dofs());
-          //cell_rhs *= -1;
+          // system_rhs.reinit(dof_handler.n_dofs());
+          // cell_rhs *= -1;
           constraints.distribute_local_to_global(
           cell_rhs, local_dof_indices, system_rhs);
         }         
@@ -384,8 +385,7 @@ namespace Project
     const FEValuesExtractors::Scalar y_displacement(1);
 
     std::map<types::global_dof_index, double> boundary_values;
-    if (update_stiffness)
-    {
+
 /*       // Right boundary, u = 0.01*L
       {
         const int boundary_id = 1;
@@ -407,13 +407,16 @@ namespace Project
           boundary_id,
           Functions::ZeroFunction<dim>(dim),
           boundary_values,
-          fe.component_mask(x_displacement));
+          fe.component_mask(x_displacement) | fe.component_mask(y_displacement));
       }
     
       // Apply the boundary conditions
-      MatrixTools::apply_boundary_values(
-      boundary_values, tangent_matrix, newton_update, system_rhs, true);
-    }
+      MatrixTools::apply_boundary_values(boundary_values, 
+                                       tangent_matrix, 
+                                       newton_update, 
+                                       system_rhs, 
+                                       true);
+    
   }
 
   template <int dim>
@@ -560,7 +563,7 @@ namespace Project
     triangulation.begin_active()->face(0)->set_boundary_id(3);
     
     // Refine the mesh
-    triangulation.refine_global(4);
+    // triangulation.refine_global(4);
 
     std::cout << "   Number of active cells:       "
               << triangulation.n_active_cells() << std::endl;
