@@ -167,8 +167,9 @@ namespace Project
       Vector<double> newton_update;
       Vector<double> system_rhs;
       SymmetricTensor<4, dim> get_stiffness(const SymmetricTensor<2, dim> &strain_tensor);
+      SymmetricTensor<4, dim> get_stiffness_linear(const SymmetricTensor<2, dim> &strain_tensor);
       SymmetricTensor<2, dim> get_stress(const SymmetricTensor<2, dim> &strain_tensor);
-      
+      SymmetricTensor<2, dim> get_stress_linear(const SymmetricTensor<2, dim> &strain_tensor);
       // Stiffness matrix
       SymmetricTensor<4, dim> stiffness;
 
@@ -197,10 +198,26 @@ namespace Project
   {
     for (unsigned int point_n = 0; point_n < 4; ++point_n)
       {
-        values[point_n][0] = force;
+        values[point_n][0] = force*0.0;
       }
   }
 
+  // Get the 4x4x4x4 stiffness matrix for the given material constants (NOT IN USE)
+  // C_ijkl = lambda * delta_ij * delta_kl + mu * (delta_ik * delta_jl + delta_il * delta_jk)
+  template <int dim>
+  SymmetricTensor<4, dim> ElasticProblem<dim>::
+                          get_stiffness_linear(const SymmetricTensor<2, dim> &strain_tensor)
+  {
+    SymmetricTensor<4, dim> tmp;
+    for (unsigned int i = 0; i < dim; ++i)
+      for (unsigned int j = 0; j < dim; ++j)
+        for (unsigned int k = 0; k < dim; ++k)
+          for (unsigned int l = 0; l < dim; ++l)
+            tmp[i][j][k][l] = (((i == k) && (j == l) ? mu : 0.0) +
+                               ((i == l) && (j == k) ? mu : 0.0) +
+                               ((i == j) && (k == l) ? lambda : 0.0));
+    return tmp;
+  }
 
   // c_ijkl(e) = a(delta_ik*delta_jl + delta_il*delta_jk) + 
   //             6*b*e_mm*delta_ij*delta_kl + 
@@ -219,6 +236,18 @@ namespace Project
                                  ((i == l) && (j == k) ? a + 3/2*c*(strain_tensor[j][k] + strain_tensor[i][l]) : 0.0) +
                                  ((i == j) && (k == l) ? 6*b*strain_tensor[m][m] : 0.0));
     return tmp;     
+  }
+
+  template <int dim>
+  SymmetricTensor<2, dim> ElasticProblem<dim>::get_stress_linear(const SymmetricTensor<2, dim> &strain_tensor)
+  {
+    SymmetricTensor<2, dim> tmp;
+    for (unsigned int i = 0; i < dim; ++i)
+      for (unsigned int j = 0; j < dim; ++j)
+        for (unsigned int m = 0; m < dim; ++m)
+            tmp[i][j] = ((i == j)  ? lambda*strain_tensor[m][m] 
+                                   : 2*mu*strain_tensor[i][j] );
+    return tmp;   
   }
 
   template <int dim>
@@ -319,17 +348,20 @@ namespace Project
           for (unsigned int j = 0; j < dofs_per_cell; ++j)
             for (unsigned int q_point = 0; q_point < n_q_points; ++q_point)
               {
+                
                 const SymmetricTensor<2, dim>
                   eps_phi_i = get_sym_grad(fe_values, i, q_point),
                   eps_phi_j = get_sym_grad(fe_values, j, q_point);
-                  stiffness = get_stiffness(strain_tensor[q_point]);
+                  stiffness = get_stiffness_linear(strain_tensor[q_point]);
 
+                const SymmetricTensor<2, dim> stress = get_stress_linear(strain_tensor[q_point]);
                 // K_ij = int(eps_i * C * eps_j) dx
                 cell_matrix(i, j) += (eps_phi_i *            
                                       stiffness * 
                                       eps_phi_j              
                                       ) *                    
                                      fe_values.JxW(q_point); 
+                cell_rhs(i) -= eps_phi_i * stress; 
               }
         }
         // Loop over all quadrature points for RHS == 0 since
@@ -342,7 +374,7 @@ namespace Project
         for (const unsigned int i : fe_values.dof_indices())
           {
             std::vector<SymmetricTensor<2, dim>> strain_tensor(n_q_points);
-            fe_values[displacement].get_function_symmetric_gradients(newton_update, strain_tensor);
+            fe_values[displacement].get_function_symmetric_gradients(solution_n, strain_tensor);
             
             const unsigned int component_i =
               fe.system_to_component_index(i).first;
@@ -352,22 +384,25 @@ namespace Project
                  {
 
                   stiffness = get_stiffness(strain_tensor[q_point]);
-                  const SymmetricTensor<2, dim> stress = get_stress(strain_tensor[q_point]);
+                  const SymmetricTensor<2, dim> stress = get_stress_linear(strain_tensor[q_point]);
                   if(update_stiffness)
                   {
                   cell_rhs(i) += (fe_values.shape_value(i, q_point) *
-                             rhs_values[q_point][component_i] )* //   - stress * strain_tensor[q_point]
-                             fe_values.JxW(q_point);
-                  // else
-                   cell_rhs(i) -= (stress * strain_tensor[q_point])* //   
-                              fe_values.JxW(q_point);
+                             (rhs_values[q_point][component_i]  ))* //   - stress * strain_tensor[q_point]
+                             fe_values.JxW(q_point) ;
+                  
                   }
+                  
+                  //else
+                  //cell_rhs(i) -= (stress * strain_tensor[q_point])* //   
+                  //           fe_values.JxW(q_point);
+                  //
                   }
           }
         // std::cout<< std::endl << "cell_rhs = " << cell_rhs << std::endl;
         // Assembly
         cell->get_dof_indices(local_dof_indices);
-        // system_rhs.reinit(dof_handler.n_dofs());
+        //system_rhs.reinit(dof_handler.n_dofs());
         if (update_stiffness)
           constraints.distribute_local_to_global(
           cell_matrix, cell_rhs, local_dof_indices, tangent_matrix, system_rhs);
@@ -386,36 +421,39 @@ namespace Project
 
     std::map<types::global_dof_index, double> boundary_values;
 
-/*       // Right boundary, u = 0.01*L
-      {
-        const int boundary_id = 1;
+    if (update_stiffness)
+    {
+           // Right boundary, u = 0.01*L
+          {
+            const int boundary_id = 1;
 
-        VectorTools::interpolate_boundary_values(
-          dof_handler,
-          boundary_id,
-          Functions::ConstantFunction<dim> (std::vector<double>({0.02, 0.})),
-          boundary_values,
-          fe.component_mask(x_displacement));
-      } */
+            VectorTools::interpolate_boundary_values(
+              dof_handler,
+              boundary_id,
+              Functions::ConstantFunction<dim> (std::vector<double>({0.02, 0.})),
+              boundary_values,
+              fe.component_mask(x_displacement));
+          } 
 
-      // Left boundary, u = 0
-      {
-        const int boundary_id = 3;
+          // Left boundary, u = 0
+          {
+            const int boundary_id = 3;
 
-        VectorTools::interpolate_boundary_values(
-          dof_handler,
-          boundary_id,
-          Functions::ZeroFunction<dim>(dim),
-          boundary_values,
-          fe.component_mask(x_displacement) | fe.component_mask(y_displacement));
+            VectorTools::interpolate_boundary_values(
+              dof_handler,
+              boundary_id,
+              Functions::ZeroFunction<dim>(dim),
+              boundary_values,
+              fe.component_mask(x_displacement) | fe.component_mask(y_displacement));
+          }
+
+          // Apply the boundary conditions
+          MatrixTools::apply_boundary_values(boundary_values, 
+                                           tangent_matrix, 
+                                           newton_update, 
+                                           system_rhs, 
+                                           true);
       }
-    
-      // Apply the boundary conditions
-      MatrixTools::apply_boundary_values(boundary_values, 
-                                       tangent_matrix, 
-                                       newton_update, 
-                                       system_rhs, 
-                                       true);
     
   }
 
@@ -429,15 +467,16 @@ namespace Project
     {
       solve();
       // constraints.distribute(newton_update);
-      assemble_system(false);
+      assemble_system(true);
       
       //solution.add(1.0, newton_update);
       solution_n += newton_update;
       residual = system_rhs.l2_norm();
       std::cout << "Newton iteration " << newton_iteration
-                << ", residual: " << residual << std::endl;
+                << "-> residual: " << residual << std::endl;
       if(residual < 1e-6)
         break;
+      //newton_update.reinit(dof_handler.n_dofs());
       newton_iteration++;
     }
   }
@@ -466,12 +505,12 @@ namespace Project
   template <int dim>
   void ElasticProblem<dim>::solve()
   {
-/*     SolverControl            solver_control(1000, 1e-12);
+    SolverControl            solver_control(1000, 1e-12);
     SolverCG<Vector<double>> solver(solver_control);
-    solver.solve(tangent_matrix, newton_update, system_rhs, PreconditionIdentity());  */
-    SparseDirectUMFPACK A_direct;
+    solver.solve(tangent_matrix, newton_update, system_rhs, PreconditionIdentity());  
+    /* SparseDirectUMFPACK A_direct;
             A_direct.initialize(tangent_matrix);
-            A_direct.vmult(newton_update, system_rhs);
+            A_direct.vmult(newton_update, system_rhs); */
   }
 
   // Output results in vtu format
@@ -534,7 +573,7 @@ namespace Project
       for (unsigned int q_point = 0; q_point < n_q_points; ++q_point)
         {
           
-          out << get_stress(strain_tensor[q_point]) << std::endl;
+          out << get_stress_linear(strain_tensor[q_point]) << std::endl;
         }
     }
   }
