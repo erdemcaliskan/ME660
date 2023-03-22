@@ -61,6 +61,10 @@
 #include <deal.II/numerics/error_estimator.h>
 #include <deal.II/numerics/matrix_tools.h>
 #include <deal.II/numerics/vector_tools.h>
+
+#include <deal.II/physics/elasticity/kinematics.h>
+#include <deal.II/physics/elasticity/standard_tensors.h>
+
 // C++ includes
 #include <fstream>
 #include <iostream>
@@ -255,13 +259,13 @@ template <int dim> class ElasticProblem
 // Constructor
 template <int dim>
 ElasticProblem<dim>::ElasticProblem()
-    : dof_handler(triangulation), fe(FE_Q<dim>(1), dim), quadrature_formula(fe.degree + 1), cycle(0), BC_TYPE(FIXED)
+    : dof_handler(triangulation), fe(FE_Q<dim>(1), dim), quadrature_formula(fe.degree + 1), BC_TYPE(UNIAXIAL)
 {
 }
 
 template <int dim> void ElasticProblem<dim>::right_hand_side(std::vector<Tensor<1, dim>> &values)
 {
-    for (auto point = 2; point < values.size(); ++point)
+    for (auto point = 0; point < values.size(); ++point)
     {
         values[point][0] = 0;
         values[point][1] = 0;
@@ -278,7 +282,8 @@ SymmetricTensor<4, dim> ElasticProblem<dim>::get_stiffness_linear(const Symmetri
         for (unsigned int j = 0; j < dim; ++j)
             for (unsigned int k = 0; k < dim; ++k)
                 for (unsigned int l = 0; l < dim; ++l)
-                    tmp[i][j][k][l] = (((i == k) && (j == l) ? mu : 0.0) + ((i == l) && (j == k) ? mu : 0.0) +
+                    tmp[i][j][k][l] = (((i == k) && (j == l) ? mu : 0.0) + 
+                                       ((i == l) && (j == k) ? mu : 0.0) +
                                        ((i == j) && (k == l) ? lambda : 0.0));
     return tmp;
 }
@@ -301,6 +306,9 @@ SymmetricTensor<4, dim> ElasticProblem<dim>::get_stiffness(const SymmetricTensor
                              ((i == l) && (j == k) ? a + 3 / 2 * c * (strain_tensor[j][k] + strain_tensor[i][l])
                                                    : 0.0) +
                              ((i == j) && (k == l) ? 6 * b * strain_tensor[m][m] : 0.0));
+    /*     tmp  = 2 * a * Physics::Elasticity::StandardTensors<dim>::IxI;
+    tmp += 12* b * trace(strain_tensor) * Physics::Elasticity::StandardTensors<dim>::IxI;
+    tmp += 3 * c * outer_product(identity_tensor<dim>()*strain_tensor, identity_tensor<dim>()*strain_tensor); */
     return tmp;
 }
 
@@ -316,14 +324,16 @@ SymmetricTensor<2, dim> ElasticProblem<dim>::get_stress_linear(const SymmetricTe
 template <int dim> SymmetricTensor<2, dim> ElasticProblem<dim>::get_stress(const SymmetricTensor<2, dim> &strain_tensor)
 {
     SymmetricTensor<2, dim> tmp;
+
+    tmp = 2* a * strain_tensor;
+
+    tmp += 3 * b * trace(strain_tensor) * trace(strain_tensor) * unit_symmetric_tensor<dim>();    
+    
     for (unsigned int i = 0; i < dim; ++i)
         for (unsigned int j = 0; j < dim; ++j)
             for (unsigned int m = 0; m < dim; ++m)
-                for (unsigned int n = 0; n < dim; ++n)
-                    tmp[i][j] =
-                        ((i == j) ? 3 * b * strain_tensor[m][m] * strain_tensor[n][n] + 2 * a * strain_tensor[i][j] +
-                                        3 * c * strain_tensor[i][m] * strain_tensor[j][m]
-                                  : 2 * a * strain_tensor[i][j] + 3 * c * strain_tensor[i][m] * strain_tensor[j][m]);
+                tmp[i][j] += 3 * c * strain_tensor[i][m] * strain_tensor[j][m];    
+
     return tmp;
 }
 
@@ -442,13 +452,11 @@ template <int dim> void ElasticProblem<dim>::assemble_system(bool update_stiffne
 
                 stiffness = get_stiffness_linear(strain_tensor[q_point]);
                 const SymmetricTensor<2, dim> stress = get_stress_linear(strain_tensor[q_point]);
-                if (update_stiffness)
-                {
-                    cell_rhs(i) += (fe_values.shape_value(i, q_point) *
-                                    (rhs_values[q_point][component_i])) * //   - stress * strain_tensor[q_point]
-                                   fe_values.JxW(q_point);
-                    cell_rhs(i) += eps_phi_i * stress;
-                }
+                //cell_rhs(i) += (fe_values.shape_value(i, q_point) *
+                //                (rhs_values[q_point][component_i])) * //   - stress * strain_tensor[q_point]
+                //               fe_values.JxW(q_point);
+
+                cell_rhs(i) += eps_phi_i * stress;
 
                 // else
                 // cell_rhs(i) -= (stress * strain_tensor[q_point])* //
@@ -459,6 +467,7 @@ template <int dim> void ElasticProblem<dim>::assemble_system(bool update_stiffne
         // std::cout<< std::endl << "cell_rhs = " << cell_rhs << std::endl;
         // Assembly
         cell->get_dof_indices(local_dof_indices);
+        std::cout << std::endl << "cell_rhs = " << cell_rhs << std::endl;
         system_rhs.reinit(dof_handler.n_dofs());
         if (update_stiffness)
             constraints.distribute_local_to_global(cell_matrix, cell_rhs, local_dof_indices, tangent_matrix,
@@ -545,7 +554,9 @@ template <int dim> void ElasticProblem<dim>::solve_nonlinear_timestep()
     double residual = 1e10;
     unsigned int newton_iteration = 0;
     assemble_system(true);
-    while (newton_iteration < 1)
+    std::cout << "Newton after assemble_system solve =" << newton_update << std::endl;
+    std::cout << "RHS after assemble_system =" << system_rhs << std::endl;
+    while (newton_iteration < 5)
     {
         std::cout << "Newton update before solve =" << newton_update << std::endl;
         std::cout << "RHS before solve =" << system_rhs << std::endl;
@@ -556,7 +567,7 @@ template <int dim> void ElasticProblem<dim>::solve_nonlinear_timestep()
         std::cout << "RHS after solve =" << system_rhs << std::endl;
         // constraints.distribute(newton_update);
 
-        assemble_system(false);
+        assemble_system(true);
         
         std::cout << "Newton update after assemble_system =" << newton_update << std::endl;
         std::cout << "RHS after assemble_system =" << system_rhs << std::endl;
@@ -566,6 +577,7 @@ template <int dim> void ElasticProblem<dim>::solve_nonlinear_timestep()
         residual = system_rhs.l2_norm();
         std::cout << "Newton iteration " << newton_iteration
                   << "-> residual: " << residual << std::endl;
+        std::cout << "--------------------------------------------" << std::endl;
         if(residual < 1e-6)
           break;
         // newton_update.reinit(dof_handler.n_dofs());
@@ -753,7 +765,8 @@ template <int dim> void ElasticProblem<dim>::run()
     std::cout << "   Number of degrees of freedom: " << dof_handler.n_dofs() << std::endl;
 
     cycle = 1;
-    for (unsigned int i = 0; i < 10; ++i)
+    
+    for (unsigned int i = 0; i < 5; ++i)
     {
         setup_system();
         std::cout << "----------------------------------------------------" << std::endl
