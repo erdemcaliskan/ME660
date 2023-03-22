@@ -253,6 +253,7 @@ template <int dim> class ElasticProblem
     static constexpr double b = -50;
     static constexpr double c = -30;
     bool first_step = true;
+    bool initial_NR_step = true;
     int cycle;
 };
 
@@ -452,14 +453,14 @@ template <int dim> void ElasticProblem<dim>::assemble_system(bool update_stiffne
 
                 stiffness = get_stiffness_linear(strain_tensor[q_point]);
                 const SymmetricTensor<2, dim> stress = get_stress_linear(strain_tensor[q_point]);
-                //cell_rhs(i) += (fe_values.shape_value(i, q_point) *
-                //                (rhs_values[q_point][component_i])) * //   - stress * strain_tensor[q_point]
-                //               fe_values.JxW(q_point);
-
-                cell_rhs(i) += eps_phi_i * stress;
+                cell_rhs(i) += (fe_values.shape_value(i, q_point) *
+                                (rhs_values[q_point][component_i])) * //   - stress * strain_tensor[q_point]
+                               fe_values.JxW(q_point) * 0;
+                
+                cell_rhs(i) -= stress * strain_tensor[q_point] * fe_values.JxW(q_point);
 
                 // else
-                // cell_rhs(i) -= (stress * strain_tensor[q_point])* //
+                // cell_rhs(i) -= (stress * strain_tensor[q_point]) //
                 //            fe_values.JxW(q_point);
                 //
             }
@@ -468,24 +469,30 @@ template <int dim> void ElasticProblem<dim>::assemble_system(bool update_stiffne
         // Assembly
         cell->get_dof_indices(local_dof_indices);
         std::cout << std::endl << "cell_rhs = " << cell_rhs << std::endl;
+        std::cout << "RHS =" << system_rhs << std::endl;
         system_rhs.reinit(dof_handler.n_dofs());
         if (update_stiffness)
+        {
             constraints.distribute_local_to_global(cell_matrix, cell_rhs, local_dof_indices, tangent_matrix,
                                                    system_rhs);
+                                                   std::cout << "RHS =" << system_rhs << std::endl;
+        }
         else
         {
             // system_rhs.reinit(dof_handler.n_dofs());
             // cell_rhs *= -1;
             constraints.distribute_local_to_global(cell_rhs, local_dof_indices, system_rhs);
+            //system_rhs *= -1;
+            std::cout << "RHS =" << system_rhs << std::endl;
         }
     }
-
+    
     // Set the boundary conditions
     const FEValuesExtractors::Scalar x_displacement(0);
     const FEValuesExtractors::Scalar y_displacement(1);
     std::map<types::global_dof_index, double> boundary_values;
 
-    if (update_stiffness)
+    if (initial_NR_step)
     {
         switch (BC_TYPE)
         {
@@ -529,6 +536,7 @@ template <int dim> void ElasticProblem<dim>::assemble_system(bool update_stiffne
             break;
         case UNIAXIAL:
             // Right boundary, u_x = 0.01*L
+            if (initial_NR_step)
             {
                 const int boundary_id = 1;
                 VectorTools::interpolate_boundary_values(
@@ -537,6 +545,7 @@ template <int dim> void ElasticProblem<dim>::assemble_system(bool update_stiffne
                     fe.component_mask(x_displacement));
             }
             // Left boundary, u_x = 0
+            if (initial_NR_step)
             {
                 const int boundary_id = 3;
                 VectorTools::interpolate_boundary_values(dof_handler, boundary_id, Functions::ZeroFunction<dim>(dim),
@@ -545,7 +554,12 @@ template <int dim> void ElasticProblem<dim>::assemble_system(bool update_stiffne
             break;
         }
         // Apply the boundary conditions
-        MatrixTools::apply_boundary_values(boundary_values, tangent_matrix, newton_update, system_rhs, true);
+        MatrixTools::apply_boundary_values(boundary_values, 
+                                           tangent_matrix, 
+                                           newton_update, 
+                                           system_rhs, 
+                                           true);
+        std::cout << "RHS =" << system_rhs << std::endl;
     }
 }
 
@@ -553,7 +567,9 @@ template <int dim> void ElasticProblem<dim>::solve_nonlinear_timestep()
 {
     double residual = 1e10;
     unsigned int newton_iteration = 0;
+    initial_NR_step = true;
     assemble_system(true);
+
     std::cout << "Newton after assemble_system solve =" << newton_update << std::endl;
     std::cout << "RHS after assemble_system =" << system_rhs << std::endl;
     while (newton_iteration < 5)
@@ -563,17 +579,20 @@ template <int dim> void ElasticProblem<dim>::solve_nonlinear_timestep()
 
         solve();
 
+        initial_NR_step = false;
+        
         std::cout << "Newton update after solve =" << newton_update << std::endl;
         std::cout << "RHS after solve =" << system_rhs << std::endl;
-        // constraints.distribute(newton_update);
-
-        assemble_system(true);
+        constraints.distribute(system_rhs);
         
+        assemble_system(true);
+
+        solution_n += newton_update;
         std::cout << "Newton update after assemble_system =" << newton_update << std::endl;
         std::cout << "RHS after assemble_system =" << system_rhs << std::endl;
         
         ////solution.add(1.0, newton_update);
-        solution_n += newton_update;
+        
         residual = system_rhs.l2_norm();
         std::cout << "Newton iteration " << newton_iteration
                   << "-> residual: " << residual << std::endl;
@@ -582,6 +601,7 @@ template <int dim> void ElasticProblem<dim>::solve_nonlinear_timestep()
           break;
         // newton_update.reinit(dof_handler.n_dofs());
         newton_iteration++;
+        
     }
 }
 
