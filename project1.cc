@@ -428,9 +428,9 @@ template <int dim> void ElasticProblem<dim>::assemble_system(bool update_stiffne
 
                         const SymmetricTensor<2, dim> eps_phi_i = get_sym_grad(fe_values, i, q_point),
                                                       eps_phi_j = get_sym_grad(fe_values, j, q_point);
-                        stiffness = get_stiffness_linear(strain_tensor[q_point]);
+                        stiffness = get_stiffness(strain_tensor[q_point]);
 
-                        const SymmetricTensor<2, dim> stress = get_stress_linear(strain_tensor[q_point]);
+                        const SymmetricTensor<2, dim> stress = get_stress(strain_tensor[q_point]);
                         // K_ij = int(eps_i * C * eps_j) dx
                         cell_matrix(i, j) += (eps_phi_i * stiffness * eps_phi_j) * fe_values.JxW(q_point);
                     }
@@ -451,14 +451,14 @@ template <int dim> void ElasticProblem<dim>::assemble_system(bool update_stiffne
             {
                 const SymmetricTensor<2, dim> eps_phi_i = get_sym_grad(fe_values, i, q_point);
 
-                stiffness = get_stiffness_linear(strain_tensor[q_point]);
-                const SymmetricTensor<2, dim> stress = get_stress_linear(strain_tensor[q_point]);
+                stiffness = get_stiffness(strain_tensor[q_point]);
+                const SymmetricTensor<2, dim> stress = get_stress(strain_tensor[q_point]);
                 cell_rhs(i) += (fe_values.shape_value(i, q_point) *
                                 (rhs_values[q_point][component_i])) * //   - stress * strain_tensor[q_point]
                                fe_values.JxW(q_point) * 0;
                 
-                cell_rhs(i) -= stress * strain_tensor[q_point] * fe_values.JxW(q_point);
-
+                //cell_rhs(i) -= stress * strain_tensor[q_point] * fe_values.JxW(q_point);
+                cell_rhs(i) += eps_phi_i * stress* fe_values.JxW(q_point);
                 // else
                 // cell_rhs(i) -= (stress * strain_tensor[q_point]) //
                 //            fe_values.JxW(q_point);
@@ -492,7 +492,7 @@ template <int dim> void ElasticProblem<dim>::assemble_system(bool update_stiffne
     const FEValuesExtractors::Scalar y_displacement(1);
     std::map<types::global_dof_index, double> boundary_values;
 
-    if (initial_NR_step)
+    if (true)
     {
         switch (BC_TYPE)
         {
@@ -544,8 +544,14 @@ template <int dim> void ElasticProblem<dim>::assemble_system(bool update_stiffne
                     Functions::ConstantFunction<dim>(std::vector<double>({0.02 , 0.0})), boundary_values,
                     fe.component_mask(x_displacement));
             }
+            else
+            {
+                const int boundary_id = 1;
+                VectorTools::interpolate_boundary_values(dof_handler, boundary_id, Functions::ZeroFunction<dim>(dim),
+                                                         boundary_values, fe.component_mask(x_displacement));
+            }
             // Left boundary, u_x = 0
-            if (initial_NR_step)
+            if (true)
             {
                 const int boundary_id = 3;
                 VectorTools::interpolate_boundary_values(dof_handler, boundary_id, Functions::ZeroFunction<dim>(dim),
@@ -569,7 +575,7 @@ template <int dim> void ElasticProblem<dim>::solve_nonlinear_timestep()
     unsigned int newton_iteration = 0;
     initial_NR_step = true;
     assemble_system(true);
-
+    solution_n += newton_update;
     std::cout << "Newton after assemble_system solve =" << newton_update << std::endl;
     std::cout << "RHS after assemble_system =" << system_rhs << std::endl;
     while (newton_iteration < 5)
@@ -733,7 +739,7 @@ template <int dim> void ElasticProblem<dim>::extract_stress()
     out << "get_sym_grad(displacement_grads[q_point] = " << std::endl;
     out << "strain_tensor[q_point] = " << std::endl;
     out << "stress = " << std::endl;
-    out << "get_stress_linear(strain_tensor[q_point])= " << std::endl;
+    out << "get_stress(strain_tensor[q_point])= " << std::endl;
 
     for (auto &cell : dof_handler.active_cell_iterators())
     {
@@ -744,14 +750,14 @@ template <int dim> void ElasticProblem<dim>::extract_stress()
         for (unsigned int q_point = 0; q_point < n_q_points; ++q_point)
         {
             out << "q_point = " << q_point << std::endl;
-            stiffness = get_stiffness_linear(strain_tensor[q_point]);
+            stiffness = get_stiffness(strain_tensor[q_point]);
             const SymmetricTensor<2, dim> stress =
                 ((stiffness * strain_tensor[q_point])); // get_sym_grad(displacement_grads[q_point])
 
             out << get_sym_grad(displacement_grads[q_point]) << std::endl;
             out << strain_tensor[q_point] << std::endl;
             out << stress << std::endl;
-            out << get_stress_linear(strain_tensor[q_point]) << std::endl;
+            out << get_stress(strain_tensor[q_point]) << std::endl;
         }
     }
 }
