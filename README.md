@@ -1,4 +1,4 @@
-# DGFEM1D
+# ME660
 
 ME 660 - Nonlinear Finite Element Methods
 
